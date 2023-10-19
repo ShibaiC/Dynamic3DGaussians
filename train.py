@@ -12,34 +12,86 @@ from helpers import setup_camera, l1_loss_v1, l1_loss_v2, weighted_l2_loss_v1, w
 from external import calc_ssim, calc_psnr, build_rotation, densify, update_params_and_optimizer
 
 
+def load_image(path):
+    # Load image and normalize it
+    im = Image.open(path)
+    im = np.array(im.copy())
+    im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
+    return im
+
+def load_segmentation(path):
+    # Load segmentation and create color segmentation
+    seg = Image.open(path)
+    seg = np.array(seg.copy()).astype(np.float32)
+    seg = torch.tensor(seg).float().cuda()
+    seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
+    return seg_col
+
 def get_dataset(t, md, seq):
     dataset = []
     for c in range(len(md['fn'][t])):
         w, h, k, w2c = md['w'], md['h'], md['k'][t][c], md['w2c'][t][c]
         cam = setup_camera(w, h, k, w2c, near=1.0, far=100)
         fn = md['fn'][t][c]
-        im = np.array(copy.deepcopy(Image.open(f"./data/{seq}/ims/{fn}")))
-        im = torch.tensor(im).float().cuda().permute(2, 0, 1) / 255
-        seg = np.array(copy.deepcopy(Image.open(f"./data/{seq}/seg/{fn.replace('.jpg', '.png')}"))).astype(np.float32)
-        seg = torch.tensor(seg).float().cuda()
-        seg_col = torch.stack((seg, torch.zeros_like(seg), 1 - seg))
+
+        # Construct paths
+        im_path = f"./data/{seq}/ims/{fn}"
+        seg_path = f"./data/{seq}/seg/{fn.replace('.jpg', '.png')}"
+
+        # Load image and segmentation
+        im = load_image(im_path)
+        seg_col = load_segmentation(seg_path)
+
         dataset.append({'cam': cam, 'im': im, 'seg': seg_col, 'id': c})
+        
     return dataset
 
 
+
+from random import randint
+
 def get_batch(todo_dataset, dataset):
+    """
+    This function returns a random element from the todo_dataset.
+    If the todo_dataset is empty, it is reinitialized with the dataset.
+
+    Parameters:
+    todo_dataset (list): The list of elements to choose from. 
+                         It can be empty, in which case it will be reinitialized.
+    dataset (list): The original list of elements. This is used to reinitialize todo_dataset when it's empty.
+
+    Returns:
+    object: A randomly chosen element from the todo_dataset.
+    """
+
+    # Check if the input is a list
+    if not isinstance(todo_dataset, list) or not isinstance(dataset, list):
+        raise ValueError("Both todo_dataset and dataset should be lists.")
+
+    # If todo_dataset is empty, reinitialize it with dataset
     if not todo_dataset:
+        if not dataset:
+            raise ValueError("Both todo_dataset and dataset are empty.")
         todo_dataset = dataset.copy()
+
+    # Choose a random element from the todo_dataset
     curr_data = todo_dataset.pop(randint(0, len(todo_dataset) - 1))
+
     return curr_data
 
 
+
 def initialize_params(seq, md):
+    # Load initial point cloud data
     init_pt_cld = np.load(f"./data/{seq}/init_pt_cld.npz")["data"]
     seg = init_pt_cld[:, 6]
     max_cams = 50
+
+    # Compute mean square distance
     sq_dist, _ = o3d_knn(init_pt_cld[:, :3], 3)
     mean3_sq_dist = sq_dist.mean(-1).clip(min=0.0000001)
+
+    # Initialize parameters
     params = {
         'means3D': init_pt_cld[:, :3],
         'rgb_colors': init_pt_cld[:, 3:6],
@@ -50,15 +102,24 @@ def initialize_params(seq, md):
         'cam_m': np.zeros((max_cams, 3)),
         'cam_c': np.zeros((max_cams, 3)),
     }
-    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in
-              params.items()}
-    cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  # Get scene radius
+
+    # Convert parameters to PyTorch tensors
+    params = {k: torch.nn.Parameter(torch.tensor(v).cuda().float().contiguous().requires_grad_(True)) for k, v in params.items()}
+
+    # Compute camera centers and scene radius
+    cam_centers = np.linalg.inv(md['w2c'][0])[:, :3, 3]  
     scene_radius = 1.1 * np.max(np.linalg.norm(cam_centers - np.mean(cam_centers, 0)[None], axis=-1))
-    variables = {'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                 'scene_radius': scene_radius,
-                 'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
-                 'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()}
+
+    # Initialize variables
+    variables = {
+        'max_2D_radius': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+        'scene_radius': scene_radius,
+        'means2D_gradient_accum': torch.zeros(params['means3D'].shape[0]).cuda().float(),
+        'denom': torch.zeros(params['means3D'].shape[0]).cuda().float()
+    }
+
     return params, variables
+
 
 
 def initialize_optimizer(params, variables):
